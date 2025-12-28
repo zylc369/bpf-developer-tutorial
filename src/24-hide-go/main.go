@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -12,9 +13,9 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 )
@@ -31,20 +32,21 @@ type event struct {
 
 // 命令行参数
 type config struct {
-	pidToHide int
+	pidToHide  int
 	targetPpid int
 }
 
 // 程序状态
 type pidHideApp struct {
-	objs     bpfObjects
-	links    []link.Link
-	config   config
+	objs   bpfObjects
+	links  []link.Link
+	config config
+	cancel context.CancelFunc
 }
 
 func main() {
 	var cfg config
-	
+
 	// 解析命令行参数
 	flag.IntVar(&cfg.pidToHide, "p", 0, "Process ID to hide. Defaults to this program")
 	flag.IntVar(&cfg.targetPpid, "t", 0, "Optional Parent PID, will only affect its children.")
@@ -56,6 +58,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 创建带取消功能的上下文
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// 停止信号通道，用于优雅退出
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
@@ -63,24 +69,29 @@ func main() {
 	// 创建应用程序实例
 	app := &pidHideApp{
 		config: cfg,
+		cancel: cancel,
 	}
+
+	// 启动清理goroutine
+	go func() {
+		<-stopper
+		log.Println("Received signal, exiting program..")
+		cancel()
+		// 给清理操作一点时间
+		time.Sleep(100 * time.Millisecond)
+		if err := app.close(); err != nil {
+			log.Printf("Error closing program: %v", err)
+		}
+		os.Exit(0)
+	}()
 
 	// 初始化并运行程序
-	if err := app.run(); err != nil {
+	if err := app.run(ctx); err != nil {
 		log.Fatalf("Error running program: %v", err)
-	}
-
-	// 等待停止信号
-	<-stopper
-	log.Println("Received signal, exiting program..")
-	
-	// 清理资源
-	if err := app.close(); err != nil {
-		log.Fatalf("Error closing program: %v", err)
 	}
 }
 
-func (app *pidHideApp) run() error {
+func (app *pidHideApp) run(ctx context.Context) error {
 	// 1. 移除内存限制
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock: %w", err)
@@ -94,21 +105,15 @@ func (app *pidHideApp) run() error {
 
 	// 3. 设置全局变量（只读数据）
 	spec.RewriteConstants(map[string]interface{}{
-		"pid_to_hide":      uint32(app.config.pidToHide),
-		"pid_to_hide_len":  uint32(len(strconv.Itoa(app.config.pidToHide)) + 1),
-		"target_ppid":      uint32(app.config.targetPpid),
+		"pid_to_hide":     uint32(app.config.pidToHide),
+		"pid_to_hide_len": uint32(len(strconv.Itoa(app.config.pidToHide)) + 1),
+		"target_ppid":     uint32(app.config.targetPpid),
 	})
 
 	// 4. 加载BPF程序到内核
 	if err := spec.LoadAndAssign(&app.objs, nil); err != nil {
 		return fmt.Errorf("load and assign BPF objects: %w", err)
 	}
-	defer func() {
-		// 如果后续出错，清理已加载的资源
-		if err != nil {
-			app.objs.Close()
-		}
-	}()
 
 	// 5. 设置程序数组映射（尾调用）
 	// 添加handle_getdents_exit到索引1
@@ -140,7 +145,10 @@ func (app *pidHideApp) run() error {
 
 	// 8. 启动事件处理goroutine
 	events := make(chan event, 100)
-	go app.handleEvents(rb, events)
+	done := make(chan struct{})
+	defer close(done)
+
+	go app.handleEvents(ctx, rb, events, done)
 
 	// 9. 打印启动信息
 	fmt.Printf("Successfully started!\n")
@@ -148,11 +156,19 @@ func (app *pidHideApp) run() error {
 	if app.config.targetPpid > 0 {
 		fmt.Printf("Only affecting children of PID %d\n", app.config.targetPpid)
 	}
+	fmt.Printf("Press Ctrl+C to exit\n")
 
 	// 10. 主循环：处理事件
 	for {
 		select {
-		case e := <-events:
+		case <-ctx.Done():
+			log.Println("Context cancelled, exiting main loop")
+			return nil
+		case e, ok := <-events:
+			if !ok {
+				log.Println("Events channel closed, exiting main loop")
+				return nil
+			}
 			if e.Success {
 				comm := string(e.Comm[:bytes.IndexByte(e.Comm[:], 0)])
 				fmt.Printf("Hid PID from program %d (%s)\n", e.Pid, comm)
@@ -164,78 +180,104 @@ func (app *pidHideApp) run() error {
 	}
 }
 
-func (app *pidHideApp) handleEvents(rb *ringbuf.Reader, events chan<- event) {
-	var e event
+func (app *pidHideApp) handleEvents(ctx context.Context, rb *ringbuf.Reader, events chan<- event, done chan struct{}) {
+	defer close(events)
 	
+	var e event
+
 	for {
-		record, err := rb.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				// 环形缓冲区已关闭，正常退出
-				return
-			}
-			log.Printf("Error reading from ringbuf: %v", err)
-			continue
-		}
-
-		// 解析事件数据
-		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &e); err != nil {
-			log.Printf("Error parsing event: %v", err)
-			continue
-		}
-
-		// 发送事件到主循环
 		select {
-		case events <- e:
+		case <-ctx.Done():
+			log.Println("Context cancelled, exiting event handler")
+			return
+		case <-done:
+			log.Println("Done signal received, exiting event handler")
+			return
 		default:
-			log.Println("Events channel full, dropping event")
+			// 设置非阻塞读取，以便可以检查上下文取消
+			record, err := rb.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					// 环形缓冲区已关闭，正常退出
+					return
+				}
+				// 对于非阻塞错误，继续循环
+				log.Printf("Error reading from ringbuf: %v", err)
+				continue
+			}
+
+			// 解析事件数据
+			if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &e); err != nil {
+				log.Printf("Error parsing event: %v", err)
+				continue
+			}
+
+			// 发送事件到主循环
+			select {
+			case events <- e:
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			default:
+				log.Println("Events channel full, dropping event")
+			}
 		}
 	}
 }
 
 func (app *pidHideApp) close() error {
-	// 1. 关闭所有链接
-	for _, l := range app.links {
-		if err := l.Close(); err != nil {
-			log.Printf("Error closing link: %v", err)
-		}
+    log.Println("Starting graceful shutdown...")
+    
+    // 收集所有错误
+    var errs []error
+    
+    // 阶段1: 停止新的事件处理
+    app.cancel()
+    
+    // 阶段2: 断开所有eBPF链接
+    if len(app.links) > 0 {
+        log.Printf("Detaching %d eBPF links...", len(app.links))
+        for i, link := range app.links {
+            if err := link.Close(); err != nil {
+                errMsg := fmt.Errorf("failed to detach link %d: %w", i, err)
+                errs = append(errs, errMsg)
+                log.Println(errMsg)
+            }
+        }
+        app.links = nil // 防止重复关闭
+    }
+    
+    // 短暂等待确保没有正在执行的eBPF调用
+    time.Sleep(100 * time.Millisecond)
+    
+    // 阶段3: 卸载eBPF程序
+    log.Println("Unloading eBPF programs from kernel...")
+    if err := app.objs.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close eBPF objects: %w", err))
+		log.Printf("Error unloading eBPF programs: %v", err)
 	}
-
-	// 2. 关闭BPF对象
-	if err := app.objs.Close(); err != nil {
-		return fmt.Errorf("close BPF objects: %w", err)
-	}
-
-	return nil
+    
+    // 阶段4: 检查是否还有残留的eBPF程序（调试用）
+    app.checkForOrphanedPrograms()
+    
+    if len(errs) > 0 {
+        return fmt.Errorf("shutdown completed with %d error(s), first error: %w", 
+            len(errs), errs[0])
+    }
+    
+    log.Println("Shutdown completed successfully")
+    return nil
 }
 
-// 如果你使用perf事件缓冲区而不是ringbuf，这里有一个替代版本：
-func handlePerfEvents(rd *perf.Reader, events chan<- event) {
-	for {
-		record, err := rd.Read()
-		if err != nil {
-			if errors.Is(err, perf.ErrClosed) {
-				return
-			}
-			log.Printf("Error reading from perf buffer: %v", err)
-			continue
-		}
-
-		if record.LostSamples > 0 {
-			log.Printf("Lost %d samples", record.LostSamples)
-			continue
-		}
-
-		var e event
-		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &e); err != nil {
-			log.Printf("Error parsing event: %v", err)
-			continue
-		}
-
-		select {
-		case events <- e:
-		default:
-			log.Println("Events channel full, dropping event")
-		}
-	}
+// 调试函数：检查是否有孤立的eBPF程序
+func (app *pidHideApp) checkForOrphanedPrograms() {
+    // 可以通过 /sys/fs/bpf/ 检查或使用 bpftool
+    // 这里只是一个示例
+    log.Println("Checking for orphaned eBPF programs...")
+    
+    // 实际实现可能包括：
+    // 1. 检查 /sys/fs/bpf/ 中的挂载点
+    // 2. 执行 bpftool prog list
+    // 3. 检查 /proc/kallsyms 中是否有相关符号
 }

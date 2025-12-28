@@ -105,11 +105,24 @@ func (app *pidHideApp) run(ctx context.Context) error {
 	}
 
 	// 3. 设置全局变量（只读数据）
-	spec.RewriteConstants(map[string]interface{}{
-		"pid_to_hide":     uint32(app.config.pidToHide),
+	// 首先检查变量是否存在
+	for name, variable := range spec.Variables {
+		fmt.Printf("Found variable: %s,variable=%s\n", name, variable)
+	}
+	// 将PID转换为字符串（因为BPF程序中可能需要字符串比较）
+	pidStr := strconv.Itoa(app.config.pidToHide)
+	// 创建一个16字节的数组（包括null终止符）
+	var pidBuffer [16]byte
+	copy(pidBuffer[:], pidStr)
+	constants := map[string]interface{}{
+		"pid_to_hide":     pidBuffer,
 		"pid_to_hide_len": uint32(len(strconv.Itoa(app.config.pidToHide)) + 1),
 		"target_ppid":     uint32(app.config.targetPpid),
-	})
+	}
+	// 设置常量
+	if err := spec.RewriteConstants(constants); err != nil {
+		return fmt.Errorf("replace constants: %w,constants=%s", err, constants)
+	}
 
 	// 4. 加载BPF程序到内核
 	if err := spec.LoadAndAssign(&app.objs, nil); err != nil {

